@@ -5,9 +5,8 @@
   "type": "module",
   "description": "TalkReady — voice English trainer for networking (Vite + React, Anthropic proxy).",
   "scripts": {
-    "dev": "concurrently -k -n api,web -c green,cyan \"npm:dev:api\" \"npm:dev:web\"",
-    "dev:web": "vite",
-    "dev:api": "node server.js",
+    "dev": "vite",
+    "dev:claude": "concurrently -k -n api,web -c green,cyan \"node server.js\" \"vite\"",
     "build": "vite build",
     "preview": "vite preview"
   },
