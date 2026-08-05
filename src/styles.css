@@ -17,6 +17,7 @@
   --radius-lg:   26px;
   --gap:         16px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-top:    env(safe-area-inset-top, 0px);
 
   --font: "Manrope", "Inter", Arial, sans-serif;
 }
@@ -43,6 +44,9 @@ h1, h2, h3 { font-weight: 700; margin: 0; line-height: 1.25; }
 
 .app {
   height: 100%;
+  /* На мобильном адресная строка съезжает и меняет высоту вьюпорта.
+     dvh учитывает это, 100% остаётся запасным вариантом для старых браузеров. */
+  height: 100dvh;
   max-width: 560px;
   margin: 0 auto;
   display: flex;
@@ -55,13 +59,16 @@ h1, h2, h3 { font-weight: 700; margin: 0; line-height: 1.25; }
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 20px var(--gap) calc(20px + var(--safe-bottom));
+  padding: calc(20px + var(--safe-top)) var(--gap) calc(20px + var(--safe-bottom));
   overflow-y: auto;
 }
 
 /* ---------- стартовый экран ---------- */
 
-.intro { gap: 20px; justify-content: center; }
+/* Без justify-content: center. У прокручиваемого flex-контейнера центрирование
+   срезает ВЕРХ содержимого, и доскроллить до него нельзя — на телефоне пропадал
+   заголовок. Кнопку вниз двигает .spacer, этого достаточно. */
+.intro { gap: 20px; }
 
 .brand {
   font-size: 14px;

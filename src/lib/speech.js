@@ -23,16 +23,28 @@ function ttsSupported() {
 
 // Голоса в Chrome подгружаются асинхронно: сразу после загрузки страницы
 // getVoices() часто возвращает пустой массив.
+//
+// Качество голосов на одном устройстве различается сильно, и по умолчанию
+// браузер берёт не лучший. Поэтому выбираем осознанно: сетевые голоса
+// (localService === false) синтезируются на сервере и звучат заметно живее
+// локальных «compact», которые и дают тот самый механический тон.
 function getEnglishVoice() {
   if (!ttsSupported()) return null;
   const voices = window.speechSynthesis.getVoices() || [];
-  if (!voices.length) return null;
-  return (
-    voices.find((v) => /^en[-_]US$/i.test(v.lang) && /female|samantha|zira|aria/i.test(v.name)) ||
-    voices.find((v) => /^en[-_]US$/i.test(v.lang)) ||
-    voices.find((v) => /^en/i.test(v.lang)) ||
-    null
-  );
+  const en = voices.filter((v) => /^en([-_]|$)/i.test(v.lang));
+  if (!en.length) return null;
+
+  const score = (v) => {
+    let s = 0;
+    if (v.localService === false) s += 5;                          // сетевой — обычно лучший
+    if (/natural|neural|enhanced|premium|wavenet/i.test(v.name)) s += 4;
+    if (/google/i.test(v.name)) s += 3;
+    if (/compact|espeak|pico/i.test(v.name)) s -= 5;               // самые роботизированные
+    if (/^en[-_](US|GB)/i.test(v.lang)) s += 1;
+    return s;
+  };
+
+  return [...en].sort((a, b) => score(b) - score(a))[0];
 }
 
 /** Прогреть список голосов заранее, чтобы первая реплика не звучала «не тем» голосом. */
