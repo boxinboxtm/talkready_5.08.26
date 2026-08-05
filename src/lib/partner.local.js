@@ -1,50 +1,65 @@
 // Локальный собеседник: работает в браузере, без ключей и без интернета.
 // Интерфейс совпадает с lib/api.js (Claude), поэтому движки взаимозаменяемы.
 //
-// Это диалоговый менеджер, а не линейный сценарий. На каждом шаге он:
-//   1) разбирает реплику человека — вопрос? тема? имя? односложно? не понял?
-//   2) реагирует на СОДЕРЖАНИЕ: отвечает на вопрос или подхватывает тему;
-//   3) выбирает следующий ход из тех, что ещё уместны.
+// ГЛАВНОЕ ПРАВИЛО: вопрос Maya может родиться только из сказанного человеком.
+// Вопрос «от себя» (OPENERS) достаётся, лишь когда зацепиться не за что,
+// и только по теме, которую человек ещё не закрыл.
 //
-// Ключевое отличие от первой версии: тема, которую человек закрыл сам,
-// больше не всплывает. Раньше Maya спрашивала «what do you do?» после того,
-// как ей уже рассказали про работу, — отсюда ощущение разговора невпопад.
+// Так выглядели провалы прошлых версий, и все три — из одного корня,
+// «вопрос берётся из очереди тем»:
+//   • «How long have you been doing that?» — когда человек ещё не сказал, чем занят;
+//   • «What kind of work are you in?» пять раз подряд;
+//   • «Have you been to any talks?» сразу после рассказа про доклад.
+//
+// В реплике максимум ОДИН вопрос — иначе получается допрос, а не разговор.
 
 import { SCENARIO } from "../config/scenario.js";
 import { LOCAL_THINKING_MS } from "../config/engine.js";
 import {
+  AGREEMENT_REACTIONS,
   ANSWERS,
+  BOUNCE_BACK,
   CLARIFY_LEAD_IN,
+  CLOSE,
+  CLOSE_SIMPLE,
   CLOSE_WITH_NAME,
-  MOVES,
   NAME_ACK,
   NEUTRAL_REACTIONS,
   NOT_A_NAME,
+  OPENERS,
+  OPENER_NO,
+  OPENER_YES,
+  OPENING,
+  OPENING_SIMPLE,
+  PRE_CLOSE,
+  PRE_CLOSE_SIMPLE,
+  RULES,
   RUSSIAN_NUDGE,
+  SHARES,
   SHORT_ANSWER_REACTIONS,
-  TOPIC_REACTIONS,
-  TOPICS,
   UNKNOWN_ANSWERS,
-  WORK_REACTIONS,
 } from "../config/partner-script.js";
 import { GROWTHS, NOTHING_TO_REVIEW, WINS } from "../config/feedback-rules.js";
 
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 /* Состояние разговора                                                 */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 
 let state = freshState();
 
 function freshState() {
   return {
-    name: null,          // имя человека, если удалось расслышать
-    nameGreeted: false,  // уже отреагировали на имя
-    covered: new Set(),  // темы, которые человек закрыл сам
-    usedMoves: new Set(),
-    lastMove: null,      // на что человек сейчас отвечает
-    retriedMove: null,   // переспрашивали не больше одного раза
-    counters: { neutral: 0, short: 0, unknown: 0 },
-    turn: 0,
+    name: null,
+    nameGreeted: false,
+    covered: new Set(),      // темы, которые человек закрыл сам
+    usedOpeners: new Set(),  // вопросы «от себя» — каждый не больше раза
+    usedFollowUps: new Set(),
+    usedShares: 0,
+    retried: new Set(),
+    pendingOpener: null,     // на какой вопрос Maya ждёт ответа
+    lastSimple: OPENING_SIMPLE, // упрощённая версия прошлой реплики — для переспроса
+    counters: { neutral: 0, short: 0, unknown: 0, agree: 0 },
+    closing: false,
   };
 }
 
@@ -52,86 +67,80 @@ export function resetPartner() {
   state = freshState();
 }
 
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 /* Разбор реплики человека                                             */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 
 const norm = (s) =>
   (s || "").toLowerCase().replace(/[^\p{L}\p{N}\s'?]/gu, " ").replace(/\s+/g, " ").trim();
 const words = (s) => norm(s).split(" ").filter(Boolean);
-
 const hasCyrillic = (s) => /[Ѐ-ӿ]/.test(s || "");
 
 const NOT_UNDERSTOOD =
-  /\b(sorry|pardon|again|repeat|what do you mean|didn'?t (catch|understand|get)|say that again|what was that|slower|slowly|i don'?t understand)\b/;
+  /\b(pardon|say (that|it) again|come again|repeat|what do you mean|what does that mean|didn'?t (catch|understand|get)|don'?t understand|slower|more slowly)\b/;
 
 const QUESTION_START =
-  /^(what|where|when|why|how|who|which|do|does|did|are|is|was|can|could|would|will|have|has|and you|what about)\b/;
+  /^(what|where|when|why|how|who|which|do|does|did|are|is|was|were|can|could|would|will|have|has|any|and you|what about|how about)\b/;
 
-// Прощание. "nice to meet you" — это ПРИВЕТСТВИЕ, ловим только прошедшее время и явные формулы.
+// Прощание. «nice to meet you» — это ПРИВЕТСТВИЕ; ловим прошедшее время и явные формулы.
 const CLOSING =
-  /\b(bye|goodbye|see you( later| around)?|take care|have a (good|great|nice) (day|one|evening)|enjoy the rest|(it )?was (really |so |very )?(nice|great|good|lovely) (talking|meeting|to talk|to meet)|nice talking to you)\b/;
+  /\b(bye|goodbye|see you( later| around| soon)?|take care|have a (good|great|nice) (day|one|evening|time)|enjoy the rest|(it )?was (really |so |very )?(nice|great|good|lovely) (talking|meeting|to talk|to meet)|nice talking to you|i (have to|should|need to) (go|run))\b/;
 
 const GREETING = /\b(hi|hello|hey|good (morning|afternoon|evening)|nice to meet)\b/;
 const INTRO = /\b(i'?m|i am|my name is|call me)\b/;
 
-// Реплики без содержания: подтвердил и всё.
-const NO_CONTENT = /^(yes|yeah|yep|no|nope|ok|okay|sure|right|good|fine|nice|cool|thanks|thank you|hmm|uh|em)\.?$/;
+const NEGATIVE = /\b(no|nope|not yet|not really|haven'?t|didn'?t|never|nothing yet|afraid not)\b/;
+const AFFIRMATIVE = /\b(yes|yeah|yep|sure|of course|i did|i have|definitely|absolutely|exactly)\b/;
+const AGREEMENT =
+  /\b(sounds (good|interesting|nice|great)|that'?s (interesting|nice|cool|great)|interesting|cool|me too|same here)\b/;
 
-function looksLikeQuestion(text) {
+const NO_CONTENT =
+  /^(yes|yeah|yep|no|nope|ok|okay|sure|right|good|fine|nice|cool|thanks|thank you|hmm|uh|em|maybe|i see)\.?$/;
+
+function isQuestion(text) {
   const n = norm(text);
-  return Boolean(n) && (n.includes("?") || QUESTION_START.test(n));
+  if (!n) return false;
+  if (NOT_UNDERSTOOD.test(n)) return false; // просьба повторить — не вопрос по теме
+  return n.includes("?") || QUESTION_START.test(n);
 }
 
 /** Имя из «I'm Tania» / «my name is Anna». Профессии и служебные слова отсекаем. */
 function extractName(text) {
-  const m = (text || "").match(/\b(?:i'?m|i am|my name is|call me|this is)\s+([A-Za-z][A-Za-z'-]{1,20})/i);
+  const m = (text || "").match(
+    /\b(?:i'?m|i am|my name is|call me|this is)\s+([A-Za-z][A-Za-z'-]{1,20})/i
+  );
   if (!m) return null;
-  const candidate = m[1].toLowerCase();
-  if (NOT_A_NAME.test(candidate)) return null;
-  return candidate[0].toUpperCase() + candidate.slice(1);
+  const c = m[1].toLowerCase();
+  if (NOT_A_NAME.test(c)) return null;
+  return c[0].toUpperCase() + c.slice(1);
 }
 
 const pick = (list, i) => list[i % list.length];
 
-/* ------------------------------------------------------------------ */
-/* Реплика собеседницы                                                 */
-/* ------------------------------------------------------------------ */
+/** Следующий вопрос «от себя»: не повторяемся и не лезем в закрытую тему. */
+function nextOpener() {
+  return OPENERS.find((o) => !state.usedOpeners.has(o.id) && !state.covered.has(o.topic)) || null;
+}
+
+function takeOpener(o) {
+  state.usedOpeners.add(o.id);
+  state.pendingOpener = o;
+  state.lastSimple = o.simple;
+  return o.line;
+}
+
+function nextShare() {
+  return SHARES[state.usedShares++ % SHARES.length];
+}
+
+/* ================================================================== */
+/* Сборка реплики                                                      */
+/* ================================================================== */
 
 const delay = () => {
   const [lo, hi] = LOCAL_THINKING_MS;
   return new Promise((r) => setTimeout(r, lo + Math.random() * (hi - lo)));
 };
-
-function chooseMove() {
-  const move = MOVES.find((m) => !state.usedMoves.has(m.id) && m.needs(state));
-  return move || MOVES[MOVES.length - 1]; // на дне списка — прощание
-}
-
-function takeMove(move) {
-  state.usedMoves.add(move.id);
-  state.lastMove = move;
-  return move;
-}
-
-/** Подхват по существу: сфера работы или тема. Null, если зацепиться не за что. */
-function substantiveAck(n, topics) {
-  const work = WORK_REACTIONS.find((w) => w.match.test(n));
-  if (work) return work.reply;
-
-  for (const t of topics) {
-    const bank = TOPIC_REACTIONS[t];
-    if (bank) return pick(bank, state.counters.neutral++);
-  }
-  return null;
-}
-
-/** Подхват «ни о чём»: годится, только когда сказать по существу нечего. */
-function genericAck(raw) {
-  return words(raw).length <= 3
-    ? pick(SHORT_ANSWER_REACTIONS, state.counters.short++)
-    : pick(NEUTRAL_REACTIONS, state.counters.neutral++);
-}
 
 /**
  * @param {{history: {role:string, content:string}[], aiTurn:number}} args
@@ -139,104 +148,161 @@ function genericAck(raw) {
  */
 export async function askPartner({ history, aiTurn }) {
   await delay();
-  state.turn = aiTurn;
 
   const raw = [...history].reverse().find((m) => m.role === "user")?.content || "";
 
-  // Первая реплика: человек ещё ничего не сказал.
+  /* ---- первая реплика ---- */
   if (aiTurn === 1 || !raw) {
-    const move = takeMove(MOVES.find((m) => m.id === "askWork"));
-    return {
-      text: "Hi! I don't think we've met. I'm Maya — I'm a product designer at Northwind Labs. " + move.line,
-      ended: false,
-    };
+    state.lastSimple = OPENING_SIMPLE;
+    return { text: OPENING, ended: false };
   }
 
   const n = norm(raw);
 
-  // Ушли на русский — возвращаем мягко, ход не тратим (ТЗ, блок 2).
+  /* ---- русский: мягко возвращаем, ход не тратим (ТЗ, блок 2) ---- */
   if (hasCyrillic(raw)) return { text: RUSSIAN_NUDGE, ended: false };
 
-  // Не понял — повторяем СВОЙ прошлый ход проще и не двигаемся дальше.
-  if (NOT_UNDERSTOOD.test(n) && !looksLikeQuestionOther(n)) {
-    const prev = state.lastMove || MOVES[0];
-    return { text: `${CLARIFY_LEAD_IN} ${prev.simple || prev.line}`, ended: false };
+  /* ---- не понял: повторяем СВОЮ прошлую реплику проще ---- */
+  if (NOT_UNDERSTOOD.test(n)) {
+    return { text: `${CLARIFY_LEAD_IN} ${state.lastSimple}`, ended: false };
   }
 
-  // Имя запоминаем сразу, оно понадобится и в подхвате, и в прощании.
-  const foundName = extractName(raw);
-  if (foundName && !state.name) state.name = foundName;
+  /* ---- имя ---- */
+  const found = extractName(raw);
+  if (found && !state.name) state.name = found;
 
-  // Отмечаем темы, которые человек закрыл сам, — про них Maya больше не спросит.
-  const topics = TOPICS.filter((t) => t.match.test(n)).map((t) => t.id);
-  topics.forEach((t) => state.covered.add(t));
-
-  const lastTurn = aiTurn >= SCENARIO.aiTurns.max;
-  const saidGoodbye = aiTurn >= 3 && CLOSING.test(n);
-
-  // Пора прощаться: человек попрощался сам или упёрлись в лимит реплик.
-  if (lastTurn || saidGoodbye) {
-    const close = MOVES.find((m) => m.id === "close");
-    takeMove(close);
-    return {
-      text: state.name ? CLOSE_WITH_NAME(state.name) : close.line,
-      ended: true,
-    };
+  /* ---- завершение ---- */
+  if (aiTurn >= SCENARIO.aiTurns.max || (aiTurn >= 3 && CLOSING.test(n)) || state.closing) {
+    state.lastSimple = CLOSE_SIMPLE;
+    return { text: state.name ? CLOSE_WITH_NAME(state.name) : CLOSE, ended: true };
   }
 
-  // Ответ без содержания на прямой вопрос — переспрашиваем иначе, а не едем дальше.
-  const emptyAnswer = NO_CONTENT.test(n) || words(raw).length <= 1;
-  if (
-    emptyAnswer &&
-    state.lastMove?.retry &&
-    state.retriedMove !== state.lastMove.id
-  ) {
-    state.retriedMove = state.lastMove.id;
-    return {
-      text: `${pick(SHORT_ANSWER_REACTIONS, state.counters.short++)} ${state.lastMove.retry}`,
-      ended: false,
-    };
-  }
+  // Что человек сказал по существу. Правило может закрыть тему — тогда Maya
+  // про неё уже не спросит, и «расскажите про доклад → были ли вы на докладах?» не случится.
+  const rule = RULES.find((r) => r.match.test(n));
+  if (rule) rule.covers.forEach((c) => state.covered.add(c));
 
   const parts = [];
 
-  // На имя реагируем всегда и первым делом — даже если человек тут же задал вопрос.
-  // Иначе «Hi, I'm Anna. Do you like dogs?» проходило мимо имени.
-  let greetedNow = false;
+  // На имя реагируем первым делом, даже если человек сразу задал вопрос.
+  let greeted = false;
   if (state.name && !state.nameGreeted) {
     state.nameGreeted = true;
-    greetedNow = true;
+    greeted = true;
     parts.push(NAME_ACK(state.name));
   }
 
-  // Прямой вопрос получает прямой ответ. Нет ответа в банке — честно признаём.
-  if (looksLikeQuestion(raw)) {
-    const answer = ANSWERS.find((a) => a.match.test(n));
-    parts.push(answer ? answer.reply : pick(UNKNOWN_ANSWERS, state.counters.unknown++));
-  } else {
-    const ack = substantiveAck(n, topics);
-    // После «Max — nice to meet you» дежурное «Oh really?» звучало как тик.
-    // Пустой подхват добавляем, только если по существу сказать нечего и имя уже отзвучало.
-    if (ack) parts.push(ack);
-    else if (!greetedNow) parts.push(genericAck(raw));
+  // Предпоследний ход: предупреждаем об уходе, чтобы прощание не было резким.
+  const wrapUp = aiTurn >= SCENARIO.aiTurns.max - 1;
+
+  /* ================= человек задал вопрос ================= */
+  if (isQuestion(raw)) {
+    const hit = ANSWERS.find((a) => a.match.test(n));
+    parts.push(hit ? hit.reply : pick(UNKNOWN_ANSWERS, state.counters.unknown++));
+    state.lastSimple = hit ? hit.reply : parts[parts.length - 1];
+
+    if (wrapUp) return closeSoon(parts);
+
+    // Возвращаем мяч ровно один раз и только если человек ещё не рассказал о себе.
+    // Повторный вопрос «от себя» здесь и давал пять «What kind of work are you in?» подряд.
+    if (state.pendingOpener && !state.covered.has(state.pendingOpener.topic)) {
+      const o = state.pendingOpener;
+      if (!state.retried.has(o.id)) {
+        state.retried.add(o.id);
+        parts.push(o.retry);
+        state.lastSimple = o.simple;
+      }
+      state.pendingOpener = null;
+    } else if (hit && hit.id === "job" && !state.covered.has("work")) {
+      parts.push(BOUNCE_BACK);
+      state.lastSimple = BOUNCE_BACK;
+    }
+    return { text: parts.join(" "), ended: false };
   }
 
-  const move = takeMove(chooseMove());
-  parts.push(move.line);
+  /* ================= человек ответил ================= */
+  const empty = NO_CONTENT.test(n) || words(raw).length <= 1;
+  const pending = state.pendingOpener;
 
-  return { text: parts.join(" "), ended: move.id === "close" };
+  // «Not yet» — содержательный ответ. Отвечаем именно на него, а не на пустоту.
+  if (pending && !rule && NEGATIVE.test(n) && !AFFIRMATIVE.test(n)) {
+    state.pendingOpener = null;
+    parts.push(OPENER_NO[pending.topic]);
+    state.covered.add(pending.topic);
+    return wrapUp ? closeSoon(parts) : addTail(parts);
+  }
+
+  // «Yes» без подробностей — уточняем по той же теме.
+  if (pending && !rule && AFFIRMATIVE.test(n) && words(raw).length <= 4) {
+    state.pendingOpener = null;
+    parts.push(OPENER_YES[pending.topic]);
+    state.lastSimple = pending.simple;
+    return { text: parts.join(" "), ended: false };
+  }
+
+  // Односложно и мимо темы — переспрашиваем иначе, тему не бросаем.
+  if (empty && pending && !state.retried.has(pending.id)) {
+    state.retried.add(pending.id);
+    parts.push(pick(SHORT_ANSWER_REACTIONS, state.counters.short++));
+    parts.push(pending.retry);
+    state.lastSimple = pending.simple;
+    return { text: parts.join(" "), ended: false };
+  }
+
+  // Есть за что зацепиться — реагируем и, если можно, углубляем ТУ ЖЕ тему.
+  if (rule) {
+    state.pendingOpener = null;
+    parts.push(rule.react);
+    state.lastSimple = rule.react;
+
+    if (wrapUp) return closeSoon(parts);
+
+    if (rule.followUp && !state.usedFollowUps.has(rule.id)) {
+      state.usedFollowUps.add(rule.id);
+      parts.push(rule.followUp);
+      state.lastSimple = rule.followUp;
+      return { text: parts.join(" "), ended: false };
+    }
+    return addTail(parts);
+  }
+
+  // Зацепиться не за что: общая реакция, дальше — вопрос «от себя» или реплика от себя.
+  if (!greeted || words(raw).length > 3) {
+    parts.push(
+      AGREEMENT.test(n)
+        ? pick(AGREEMENT_REACTIONS, state.counters.agree++)
+        : words(raw).length <= 3
+        ? pick(SHORT_ANSWER_REACTIONS, state.counters.short++)
+        : pick(NEUTRAL_REACTIONS, state.counters.neutral++)
+    );
+  }
+
+  return wrapUp ? closeSoon(parts) : addTail(parts);
 }
 
-// «Sorry, what do you do?» — это вопрос, а не просьба повторить.
-// А вот «what do you mean» и «say that again» — именно просьба, и их надо оставить переспросу.
-function looksLikeQuestionOther(n) {
-  if (/\b(again|repeat|say that|mean|understand|catch|slower|slowly)\b/.test(n)) return false;
-  return /\b(what|where|when|why|how|who|which)\b.*\b(you|your)\b/.test(n);
+/** Хвост реплики: вопрос «от себя», если он уместен, иначе — Maya говорит о себе. */
+function addTail(parts) {
+  const opener = nextOpener();
+  if (opener) {
+    parts.push(takeOpener(opener));
+  } else {
+    const share = nextShare();
+    parts.push(share);
+    state.lastSimple = share;
+  }
+  return { text: parts.join(" "), ended: false };
 }
 
-/* ------------------------------------------------------------------ */
+function closeSoon(parts) {
+  state.closing = true;
+  parts.push(PRE_CLOSE);
+  state.lastSimple = PRE_CLOSE_SIMPLE;
+  return { text: parts.join(" "), ended: false };
+}
+
+/* ================================================================== */
 /* Обратная связь                                                      */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
 
 /** Короткая цитата: длинные реплики обрезаем, чтобы разбор не был стеной текста. */
 function quote(text, max = 12) {
@@ -263,25 +329,23 @@ export async function askFeedback({ history, hintsUsed }) {
   const last = userTurns[userTurns.length - 1];
 
   // «Hi, I'm Tania» и «Bye!» коротки по своей природе — ставить их в укор нечестно.
-  const substantive = byLength.filter((t) => {
-    const nn = norm(t);
+  const substantive = byLength.filter((x) => {
+    const nn = norm(x);
     return !GREETING.test(nn) && !CLOSING.test(nn);
   });
-  const shortestPool = substantive.length ? substantive : byLength;
-  const shortest = shortestPool[shortestPool.length - 1];
+  const pool = substantive.length ? substantive : byLength;
+  const shortest = pool[pool.length - 1];
 
-  const clarifyTurn = userTurns.find((t) => NOT_UNDERSTOOD.test(norm(t)));
-  // Переспрос — не встречный вопрос. Иначе разбор хвалит за любопытство там,
+  const clarifyTurn = userTurns.find((x) => NOT_UNDERSTOOD.test(norm(x)));
+  // Переспрос — не встречный вопрос: иначе разбор хвалит за любопытство там,
   // где человек просто не расслышал.
-  const questionTurn = userTurns.find(
-    (t) => looksLikeQuestion(t) && !NOT_UNDERSTOOD.test(norm(t))
-  );
-  const introTurn = userTurns.find((t) => INTRO.test(norm(t)));
+  const questionTurn = userTurns.find(isQuestion);
+  const introTurn = userTurns.find((x) => INTRO.test(norm(x)));
 
   const stats = {
     turns: userTurns.length,
     hintsUsed,
-    greeted: userTurns.some((t) => GREETING.test(norm(t))),
+    greeted: userTurns.some((x) => GREETING.test(norm(x))),
     introduced: Boolean(introTurn),
     introText: quote(introTurn),
     askedQuestion: Boolean(questionTurn),
@@ -291,7 +355,7 @@ export async function askFeedback({ history, hintsUsed }) {
     longestWords: words(longest).length,
     longestText: quote(longest),
     shortestText: quote(shortest),
-    avgWords: userTurns.reduce((sum, t) => sum + words(t).length, 0) / userTurns.length,
+    avgWords: userTurns.reduce((s, x) => s + words(x).length, 0) / userTurns.length,
     closed: CLOSING.test(norm(last)),
     closeText: quote(last, 8),
   };
